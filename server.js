@@ -9,10 +9,17 @@ const app = express();
 const upload = multer({ dest: "uploads/" });
 
 function sizeKB(path){
- return fs.statSync(path).size / 1024;
+  return fs.statSync(path).size / 1024;
 }
 
-// ---------- Ghostscript ----------
+function cleanTemp(){
+  if(!fs.existsSync("temp_images")) fs.mkdirSync("temp_images");
+  fs.readdirSync("temp_images").forEach(f=>{
+    fs.unlinkSync(`temp_images/${f}`);
+  });
+}
+
+// -------- Ghostscript --------
 function ghostCompress(input,output){
 
  execSync(`gs -sDEVICE=pdfwrite \
@@ -23,111 +30,123 @@ function ghostCompress(input,output){
 
 }
 
-// ---------- Extreme Adaptive ----------
+// -------- Extreme Adaptive --------
 async function extremeCompress(input,target){
 
- const qualities = [60,50,40,35,30,25,20,15];
-
- if(!fs.existsSync("temp_images")) fs.mkdirSync("temp_images");
+ cleanTemp();
 
  execSync(`pdftoppm -jpeg -r 72 ${input} temp_images/page`);
 
  const files = fs.readdirSync("temp_images")
-  .filter(f=>f.endsWith(".jpg"))
+  .filter(f => f.endsWith(".jpg") || f.endsWith(".jpeg"))
   .sort();
 
- let bestOutput = null;
+ if(files.length === 0){
+   throw new Error("Image extraction failed");
+ }
+
+ const qualities = [70,60,50,40,35,30,25,20];
+
+ let bestFile = null;
  let bestDiff = Infinity;
 
  for(const q of qualities){
 
-  const pdf = await PDFDocument.create();
+   const pdf = await PDFDocument.create();
 
-  for(const f of files){
+   for(const f of files){
 
-   const imgPath = `temp_images/${f}`;
+     const imgPath = `temp_images/${f}`;
 
-   const compressed = await sharp(imgPath)
-     .resize({width:800})
-     .jpeg({quality:q})
-     .toBuffer();
+     const imgBuffer = fs.readFileSync(imgPath);
 
-   const img = await pdf.embedJpg(compressed);
+     const compressed = await sharp(imgBuffer)
+       .resize({ width: 900 })
+       .jpeg({ quality: q })
+       .toBuffer();
 
-   const page = pdf.addPage([img.width,img.height]);
+     const img = await pdf.embedJpg(compressed);
 
-   page.drawImage(img,{
-     x:0,
-     y:0,
-     width:img.width,
-     height:img.height
-   });
+     const page = pdf.addPage([img.width, img.height]);
 
-  }
+     page.drawImage(img,{
+       x:0,
+       y:0,
+       width:img.width,
+       height:img.height
+     });
 
-  const pdfBytes = await pdf.save();
+   }
 
-  const out = `outputs/out-${Date.now()}-${q}.pdf`;
+   const pdfBytes = await pdf.save();
 
-  fs.writeFileSync(out,pdfBytes);
+   const out = `outputs/out-${Date.now()}-${q}.pdf`;
 
-  const size = sizeKB(out);
+   fs.writeFileSync(out,pdfBytes);
 
-  const diff = Math.abs(size-target);
+   const size = sizeKB(out);
 
-  if(diff < bestDiff){
-    bestDiff = diff;
-    bestOutput = out;
-  }
+   if(size < 5){
+     continue; // corrupted ignore
+   }
 
-  if(size <= target){
-    return out;
-  }
+   const diff = Math.abs(size-target);
+
+   if(diff < bestDiff){
+     bestDiff = diff;
+     bestFile = out;
+   }
+
+   if(size <= target){
+     return out;
+   }
 
  }
 
- return bestOutput;
-
+ return bestFile;
 }
 
-// ---------- API ----------
+// -------- API --------
 app.post("/compress",upload.single("file"),async(req,res)=>{
 
  try{
 
-  const input = req.file.path;
-  const target = parseInt(req.body.target);
+   const input = req.file.path;
+   const target = parseInt(req.body.target);
 
-  const original = sizeKB(input);
+   const original = sizeKB(input);
 
-  let output;
+   let output;
 
-  if(original/target > 2){
+   if(original / target > 2){
 
-   output = await extremeCompress(input,target);
+     output = await extremeCompress(input,target);
 
-  }else{
+   }else{
 
-   output = `outputs/out-${Date.now()}.pdf`;
+     output = `outputs/out-${Date.now()}.pdf`;
 
-   ghostCompress(input,output);
+     ghostCompress(input,output);
 
-  }
+   }
 
-  res.download(output);
+   if(!fs.existsSync(output)){
+     return res.status(500).send("Compression failed");
+   }
+
+   res.download(output);
 
  }catch(e){
 
-  console.error(e);
-
-  res.status(500).send("Compression error");
+   console.error(e);
+   res.status(500).send("Compression error");
 
  }
 
 });
 
 app.get("/",(req,res)=>{
- res.send("Smart compressor running");
+ res.send("Smart PDF Compressor running");
 });
 
 app.listen(3000,()=>{
