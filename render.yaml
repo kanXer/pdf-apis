@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: pdf-compress-api
+    env: node
+    buildCommand: |
+      apt-get update
+      apt-get install -y ghostscript
+      npm install
+    startCommand: node server.js
