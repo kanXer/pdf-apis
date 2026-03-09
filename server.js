@@ -6,7 +6,7 @@ import { execSync } from "child_process";
 import { PDFDocument } from "pdf-lib";
 import path from "path";
 import crypto from "crypto";
-const cors = require('cors');
+import  cors from "cors";
 
 const app = express();
 app.use(cors({
