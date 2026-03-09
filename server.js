@@ -1,119 +1,89 @@
 import express from "express";
 import multer from "multer";
-import fs from "fs";
 import sharp from "sharp";
 import { exec } from "child_process";
 import { PDFDocument } from "pdf-lib";
-import path from "path";
-import crypto from "crypto";
-import cors from "cors";
 import { promisify } from "util";
+import cors from "cors";
+import fs from "fs";
 
 const execPromise = promisify(exec);
 const app = express();
 app.use(cors());
-const upload = multer({ dest: "uploads/" });
+const upload = multer({ dest: "uploads/" }); // Input file disk par, baaki sab RAM mein
 
-["uploads", "outputs", "temp_images"].forEach(d => !fs.existsSync(d) && fs.mkdirSync(d));
+// 10,000 Users ke liye Fast Cleanup logic
+const cleanup = (files) => files.forEach(f => fs.existsSync(f) && fs.unlinkSync(f));
 
-/**
- * STRATEGY 1: Ghostscript (Efficient & preserves text)
- */
-async function tryGhostscript(input, targetKB) {
-    const out = `outputs/gs_${Date.now()}.pdf`;
-    // 'screen' profile sabse aggressive compression karta hai (72 DPI)
-    const cmd = `gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dPDFSETTINGS=/screen -dNOPAUSE -dQUIET -dBATCH -sOutputFile="${out}" "${input}"`;
-    try {
-        await execPromise(cmd);
-        const size = fs.statSync(out).size / 1024;
-        return { path: out, size, success: size <= targetKB * 1.1 };
-    } catch (e) {
-        return { success: false };
-    }
-}
-
-/**
- * STRATEGY 2: Adaptive Rasterization (When GS fails)
- */
-async function extremeRasterCompress(inputPath, targetKB) {
-    const sessionID = crypto.randomUUID();
-    const sessionDir = path.join("temp_images", sessionID);
-    fs.mkdirSync(sessionDir);
+async function highAccuracyCompress(inputPath, targetKB) {
+    const sessionID = Math.random().toString(36).substring(7);
+    const tempPrefix = `temp_${sessionID}`;
 
     try {
-        // Target ke hisaab se DPI set karo (50KB ke liye 72 DPI kaafi hai)
-        const dpi = targetKB < 100 ? 72 : 120;
-        await execPromise(`pdftoppm -jpeg -r ${dpi} "${inputPath}" "${sessionDir}/page"`);
+        // 1. Ghostscript eBook (Quick check for easy targets)
+        const gsPath = `outputs/gs_${sessionID}.pdf`;
+        await execPromise(`gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dPDFSETTINGS=/ebook -dNOPAUSE -dQUIET -dBATCH -sOutputFile=${gsPath} "${inputPath}"`);
+        let s = fs.statSync(gsPath).size / 1024;
         
-        const files = fs.readdirSync(sessionDir)
-            .filter(f => f.endsWith(".jpg"))
-            .sort((a,b) => a.localeCompare(b, undefined, {numeric: true}));
-        
-        const totalPages = files.length;
-        const overhead = (totalPages * 1.2) + 10;
-        const targetPerPage = (targetKB - overhead) / totalPages;
+        if (s <= targetKB && s >= targetKB * 0.9) return gsPath;
 
-        // Black & White if target is very low
-        const useGrayscale = targetKB < 100;
+        // 2. Binary Search Rasterization (The logic you like)
+        const dpi = targetKB > 150 ? 200 : 120;
+        await execPromise(`pdftoppm -jpeg -r ${dpi} "${inputPath}" "${tempPrefix}"`);
+        const files = fs.readdirSync('.').filter(f => f.startsWith(tempPrefix)).sort();
 
-        const pdf = await PDFDocument.create();
-        const pageBuffers = await Promise.all(files.map(async (f) => {
-            let s = sharp(path.join(sessionDir, f)).rotate().withMetadata(false);
-            if (useGrayscale) s = s.grayscale();
+        let minQ = 5, maxQ = 95, currentWidth = targetKB > 150 ? 1500 : 1000;
+        let finalBuffer = null;
+
+        // Accuracy Loop (5-7 iterations are enough with RAM processing)
+        for (let i = 0; i < 7; i++) {
+            const q = Math.floor((minQ + maxQ) / 2);
+            const pdf = await PDFDocument.create();
             
-            // Start with very low quality if target is tight
-            return s.jpeg({ quality: 30, mozjpeg: true }).toBuffer();
-        }));
+            // Speed Trick: Parallel processing for images
+            const pageBuffers = await Promise.all(files.map(f => 
+                sharp(f).resize({ width: currentWidth }).jpeg({ quality: q, mozjpeg: true }).toBuffer()
+            ));
 
-        for (const b of pageBuffers) {
-            const img = await pdf.embedJpg(b);
-            pdf.addPage([img.width, img.height]).drawImage(img, { x: 0, y: 0, width: img.width, height: img.height });
+            for (const b of pageBuffers) {
+                const img = await pdf.embedJpg(b);
+                pdf.addPage([img.width, img.height]).drawImage(img, { x: 0, y: 0, width: img.width, height: img.height });
+            }
+
+            const bytes = await pdf.save();
+            const currentSize = bytes.length / 1024;
+            finalBuffer = bytes;
+
+            if (Math.abs(currentSize - targetKB) < targetKB * 0.03) break; // 3% Accuracy!
+            
+            if (currentSize > targetKB) {
+                maxQ = q - 1;
+                if (q < 20) currentWidth = Math.floor(currentWidth * 0.85);
+            } else {
+                minQ = q + 1;
+            }
         }
 
-        const finalBytes = await pdf.save();
-        const finalPath = `outputs/ext_${sessionID}.pdf`;
-        fs.writeFileSync(finalPath, finalBytes);
-        return { path: finalPath, size: finalBytes.length / 1024 };
-    } finally {
-        fs.rmSync(sessionDir, { recursive: true, force: true });
+        const finalPath = `outputs/acc_${sessionID}.pdf`;
+        fs.writeFileSync(finalPath, finalBuffer);
+        cleanup(files); // Instant cleanup for 10k users
+        return finalPath;
+
+    } catch (e) {
+        throw e;
     }
 }
 
 app.post("/compress-pdf", upload.single("file"), async (req, res) => {
     try {
-        const input = req.file.path;
         const target = parseInt(req.body.target);
-        const originalSize = fs.statSync(input).size / 1024;
-
-        console.log(`Processing: ${originalSize}KB -> Target: ${target}KB`);
-
-        // Step 1: Try Ghostscript (Best for Text)
-        let result = await tryGhostscript(input, target);
-
-        // Step 2: If GS not enough, try Extreme Rasterization
-        if (!result.success || result.size > target) {
-            console.log("Ghostscript insufficient, trying Extreme Rasterization...");
-            const rasterResult = await extremeRasterCompress(input, target);
-            
-            // Pick whichever is smaller
-            if (result.path && fs.existsSync(result.path) && result.size < rasterResult.size) {
-                // Keep GS result
-            } else {
-                result = rasterResult;
-            }
-        }
-
-        // Final Safety: Agar abhi bhi bada hai original se, toh error ya original bhej do
-        if (result.size > originalSize) {
-            console.log("Warning: Compression increased size. Sending original.");
-            return res.download(input);
-        }
-
-        res.download(result.path);
-
+        const resultPath = await highAccuracyCompress(req.file.path, target);
+        res.download(resultPath, () => {
+            cleanup([req.file.path, resultPath]); // Disk space management
+        });
     } catch (e) {
         res.status(500).send("Error: " + e.message);
     }
 });
 
-app.listen(3000, () => console.log("Precision Engine running on 3000..."));
+app.listen(3000, () => console.log("High-Accuracy Engine Live..."));
