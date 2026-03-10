@@ -105,6 +105,149 @@ async function splitToZipAsync(inputPath, originalName) {
     } catch (e) { throw e; }
 }
 
+// --- 3. MERGE PDF (IMAGE BASED ORDER) ---
+async function mergePDFAsync(files) {
+    const sessionID = crypto.randomUUID();
+    const sessionDir = path.join("temp_images", `merge_${sessionID}`);
+    fs.mkdirSync(sessionDir, { recursive: true });
+
+    const finalPDF = await PDFDocument.create();
+
+    try {
+
+        for (let i = 0; i < files.length; i++) {
+
+            const pdfPath = files[i].path;
+            const prefix = path.join(sessionDir, `file_${i}`);
+
+            // convert pdf → images
+            await execPromise(`pdftoppm -jpeg -r 200 "${pdfPath}" "${prefix}"`);
+
+            const images = fs.readdirSync(sessionDir)
+                .filter(f => f.startsWith(`file_${i}`) && f.endsWith(".jpg"))
+                .sort((a,b)=>a.localeCompare(b,undefined,{numeric:true}));
+
+            for (const imgFile of images) {
+
+                const imgBytes = fs.readFileSync(path.join(sessionDir, imgFile));
+                const img = await finalPDF.embedJpg(imgBytes);
+
+                const page = finalPDF.addPage([img.width, img.height]);
+
+                page.drawImage(img,{
+                    x:0,
+                    y:0,
+                    width:img.width,
+                    height:img.height
+                });
+
+            }
+
+        }
+
+        const pdfBytes = await finalPDF.save();
+        const outputPath = `outputs/merged_${sessionID}.pdf`;
+
+        fs.writeFileSync(outputPath, pdfBytes);
+
+        return outputPath;
+
+    } finally {
+        fs.rmSync(sessionDir, { recursive: true, force: true });
+    }
+}
+// --- 4. WORD TO PDF ---
+async function wordToPDFAsync(inputPath) {
+
+    const sessionID = crypto.randomUUID();
+    const outputDir = path.join("outputs", `word_${sessionID}`);
+
+    fs.mkdirSync(outputDir, { recursive: true });
+
+    try {
+
+        await execPromise(`libreoffice --headless --convert-to pdf "${inputPath}" --outdir "${outputDir}"`);
+
+        const files = fs.readdirSync(outputDir).filter(f => f.endsWith(".pdf"));
+
+        if (!files.length) {
+            throw new Error("Conversion failed");
+        }
+
+        const outputPath = path.join(outputDir, files[0]);
+
+        return outputPath;
+
+    } catch (e) {
+        throw e;
+    }
+}
+
+// --- 5. IMAGE TO PDF ---
+async function imagesToPDFAsync(files) {
+
+    const sessionID = crypto.randomUUID();
+    const outputPath = `outputs/images_${sessionID}.pdf`;
+
+    const pdf = await PDFDocument.create();
+
+    for (const file of files) {
+
+        const imgBuffer = fs.readFileSync(file.path);
+
+        let image;
+
+        if (file.mimetype === "image/png") {
+            image = await pdf.embedPng(imgBuffer);
+        } else {
+            image = await pdf.embedJpg(imgBuffer);
+        }
+
+        const page = pdf.addPage([image.width, image.height]);
+
+        page.drawImage(image, {
+            x: 0,
+            y: 0,
+            width: image.width,
+            height: image.height
+        });
+
+    }
+
+    const bytes = await pdf.save();
+
+    fs.writeFileSync(outputPath, bytes);
+
+    return outputPath;
+}
+// --- 6. EXCEL TO PDF ---
+async function excelToPDFAsync(inputPath) {
+
+    const sessionID = crypto.randomUUID();
+    const outputDir = path.join("outputs", `excel_${sessionID}`);
+
+    fs.mkdirSync(outputDir, { recursive: true });
+
+    try {
+
+        await execPromise(`libreoffice --headless --convert-to pdf "${inputPath}" --outdir "${outputDir}"`);
+
+        const files = fs.readdirSync(outputDir).filter(f => f.endsWith(".pdf"));
+
+        if (!files.length) {
+            throw new Error("Conversion failed");
+        }
+
+        const outputPath = path.join(outputDir, files[0]);
+
+        return outputPath;
+
+    } catch (e) {
+        throw e;
+    }
+
+}
+
 // --- ENDPOINTS ---
 app.post("/compress-pdf", upload.single("file"), async (req, res) => {
     try {
@@ -127,5 +270,95 @@ app.post("/split-pdf", upload.single("file"), async (req, res) => {
         res.download(zipPath, "fastpdftool.zip", () => safeDelete([req.file.path, zipPath]));
     } catch (e) { if (req.file) safeDelete([req.file.path]); res.status(500).send("Error: " + e.message); }
 });
+app.post("/merge-pdf", upload.array("files", 20), async (req, res) => {
 
+    try {
+
+        if (!req.files || req.files.length === 0) {
+            return res.status(400).send("No files uploaded");
+        }
+
+        const mergedPath = await mergePDFAsync(req.files);
+
+        res.download(mergedPath, "merged.pdf", () => {
+            safeDelete(req.files.map(f => f.path));
+            safeDelete([mergedPath]);
+        });
+
+    } catch (e) {
+
+        if (req.files) safeDelete(req.files.map(f => f.path));
+
+        res.status(500).send("Error: " + e.message);
+    }
+
+});
+app.post("/word-to-pdf", upload.single("file"), async (req, res) => {
+
+    try {
+
+        const pdfPath = await wordToPDFAsync(req.file.path);
+
+        res.download(pdfPath, "converted.pdf", () => {
+
+            safeDelete([req.file.path]);
+            safeDelete([pdfPath]);
+
+        });
+
+    } catch (e) {
+
+        if (req.file) safeDelete([req.file.path]);
+
+        res.status(500).send("Error: " + e.message);
+    }
+
+});
+app.post("/image-to-pdf", upload.array("files", 20), async (req, res) => {
+
+    try {
+
+        if (!req.files || req.files.length === 0) {
+            return res.status(400).send("No images uploaded");
+        }
+
+        const pdfPath = await imagesToPDFAsync(req.files);
+
+        res.download(pdfPath, "images.pdf", () => {
+
+            safeDelete(req.files.map(f => f.path));
+            safeDelete([pdfPath]);
+
+        });
+
+    } catch (e) {
+
+        if (req.files) safeDelete(req.files.map(f => f.path));
+
+        res.status(500).send("Error: " + e.message);
+    }
+
+});
+app.post("/excel-to-pdf", upload.single("file"), async (req, res) => {
+
+    try {
+
+        const pdfPath = await excelToPDFAsync(req.file.path);
+
+        res.download(pdfPath, "excel.pdf", () => {
+
+            safeDelete([req.file.path]);
+            safeDelete([pdfPath]);
+
+        });
+
+    } catch (e) {
+
+        if (req.file) safeDelete([req.file.path]);
+
+        res.status(500).send("Error: " + e.message);
+
+    }
+
+});
 app.listen(3000, () => console.log("Engine running on 3000..."));
