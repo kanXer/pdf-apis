@@ -4,6 +4,6 @@ services:
     env: node
     buildCommand: |
       apt-get update
-      apt-get install -y --no-install-recommends ghostscript poppler-utils libreoffice-writer libreoffice-calc fonts-liberation ttf-dejavu
+      apt-get install -y ghostscript poppler-utils libreoffice
       npm install
     startCommand: node server.js
