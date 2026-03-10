@@ -361,4 +361,19 @@ app.post("/excel-to-pdf", upload.single("file"), async (req, res) => {
     }
 
 });
+app.get("/check-setup", async (req, res) => {
+    try {
+        const { stdout: gs } = await execPromise("gs --version");
+        const { stdout: lo } = await execPromise("libreoffice --version").catch(() => ({ stdout: "Not Found" }));
+        const { stdout: pop } = await execPromise("pdftoppm -v").catch(() => ({ stdout: "Not Found" }));
+
+        res.json({
+            ghostscript: gs.trim(),
+            libreoffice: lo.trim(),
+            poppler: pop.trim().split('\n')[0]
+        });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
 app.listen(3000, () => console.log("Engine running on 3000..."));
